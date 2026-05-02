@@ -9,7 +9,7 @@
   },
   "sources": ["HuggingFace", "ModelScope"],
   "defaults": {
-    "repo_id": "Qwen/Qwen3-ASR-0.6B",
+    "repo_id": "Qwen3-ASR-1.7B",
     "source": "HuggingFace",
     "precision": "bf16",
     "attention": "auto",
