@@ -38,7 +38,7 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS, PreTrainedModel
 from transformers.processing_utils import Unpack
 from transformers.utils import auto_docstring, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
-from transformers.utils.generic import TransformersKwargs, check_model_inputs
+from transformers.utils.generic import TransformersKwargs, merge_with_config_defaults
 
 from .configuration_qwen3_asr import (
     Qwen3ASRAudioEncoderConfig,
@@ -791,13 +791,49 @@ class Qwen3ASRThinkerTextRotaryEmbedding(nn.Module):
         self.original_max_seq_len = config.max_position_embeddings
 
         self.config = config
-        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        # Newer transformers versions removed the 'default' key from ROPE_INIT_FUNCTIONS;
+        # fall back to a simple standard RoPE initialisation when it is missing.
+        if self.rope_type in ROPE_INIT_FUNCTIONS:
+            self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+        else:
+            self.rope_init_fn = self._default_rope_init_fn
 
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = self.inv_freq
 
-        self.mrope_section = config.rope_scaling.get("mrope_section", [24, 20, 20])
+        # rope_scaling may be None when rope_type fell back to "default"
+        rope_scaling = config.rope_scaling if config.rope_scaling is not None else {}
+        self.mrope_section = rope_scaling.get("mrope_section", [24, 20, 20])
+
+    @staticmethod
+    def _default_rope_init_fn(config, device=None, **kwargs):
+        """Fallback standard RoPE init for transformers versions that no longer
+        ship a 'default' entry in ROPE_INIT_FUNCTIONS."""
+        head_dim = getattr(
+            config,
+            "head_dim",
+            config.hidden_size // config.num_attention_heads,
+        )
+        base = getattr(config, "rope_theta", 10000.0)
+        inv_freq = 1.0 / (
+            base
+            ** (
+                torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
+                / head_dim
+            )
+        )
+        return inv_freq, 1.0
+
+    def compute_default_rope_parameters(self, config=None, device=None, seq_len=None, **rope_kwargs):
+        """Required by newer transformers _init_weights to reinitialise inv_freq
+        after weight loading. Delegates to whichever rope_init_fn was chosen at
+        construction time (from ROPE_INIT_FUNCTIONS or our own fallback)."""
+        cfg = config if config is not None else self.config
+        dev = device if device is not None else (
+            self.inv_freq.device if hasattr(self, "inv_freq") else None
+        )
+        return self.rope_init_fn(cfg, dev, **rope_kwargs)
 
     def apply_interleaved_mrope(self, freqs, mrope_section):
         """Apply interleaved MRoPE to 3D rotary embeddings.
@@ -969,7 +1005,7 @@ class Qwen3ASRThinkerTextModel(Qwen3ASRPreTrainedModel):
 
     def __init__(self, config: Qwen3ASRConfig):
         super().__init__(config)
-        self.padding_idx = config.pad_token_id
+        self.padding_idx = getattr(config, "pad_token_id", None)
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
@@ -983,7 +1019,7 @@ class Qwen3ASRThinkerTextModel(Qwen3ASRPreTrainedModel):
         # Initialize weights and apply final processing
         self.post_init()
 
-    @check_model_inputs()
+    @merge_with_config_defaults
     @auto_docstring
     def forward(
         self,
@@ -1086,7 +1122,8 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
             self.lm_head = nn.Linear(config.text_config.hidden_size, config.classify_num, bias=False)
         else:
             self.lm_head = nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
-        self.pad_token_id = self.config.pad_token_id if self.config.pad_token_id is not None else -1
+        _pad = getattr(self.config, "pad_token_id", None)
+        self.pad_token_id = _pad if _pad is not None else -1
         self.rope_deltas = None
         self.post_init()
 
@@ -1208,11 +1245,18 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
             audio_feature_lengths = None
 
         if attention_mask is not None and position_ids is None:
-            if (
-                cache_position is None
-                or (cache_position is not None and cache_position[0] == 0)
-                or self.rope_deltas is None
-            ):
+            # In newer transformers versions, `cache_position` is no longer auto-passed by
+            # `prepare_inputs_for_generation`. Detect prefill vs decode via past_key_values length
+            # so we don't recompute full-length position_ids at decode steps (which would broadcast
+            # rotary embeddings and desynchronise K/V cache lengths).
+            past_seen_tokens = (
+                past_key_values.get_seq_length() if past_key_values is not None else 0
+            )
+            if cache_position is not None:
+                is_prefill = cache_position[0] == 0
+            else:
+                is_prefill = past_seen_tokens == 0
+            if is_prefill or self.rope_deltas is None:
                 delta0 = (1 - attention_mask).sum(dim=-1).unsqueeze(1)
                 position_ids, rope_deltas = self.get_rope_index(
                     attention_mask,
@@ -1221,7 +1265,10 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
                 self.rope_deltas = rope_deltas
             else:
                 batch_size, seq_length = input_ids.shape
-                delta = cache_position[0] + self.rope_deltas if cache_position is not None else 0
+                if cache_position is not None:
+                    delta = cache_position[0] + self.rope_deltas
+                else:
+                    delta = past_seen_tokens + self.rope_deltas
                 position_ids = torch.arange(seq_length, device=input_ids.device)
                 position_ids = position_ids.view(1, -1).expand(batch_size, -1)
                 position_ids = position_ids.add(delta)
@@ -1283,8 +1330,16 @@ class Qwen3ASRThinkerForConditionalGeneration(Qwen3ASRPreTrainedModelForConditio
 
         model_inputs["position_ids"] = None
 
-        if cache_position[0] != 0:
+        # In newer transformers, `cache_position` is no longer auto-injected. Use cache length
+        # to determine if we're past the prefill step (drop input_features after prefill).
+        is_decode_step = False
+        if cache_position is not None:
+            is_decode_step = cache_position[0] != 0
+        elif past_key_values is not None and past_key_values.get_seq_length() > 0:
+            is_decode_step = True
+        if is_decode_step:
             model_inputs["input_features"] = None
+            model_inputs["feature_attention_mask"] = None
 
         return model_inputs
 
